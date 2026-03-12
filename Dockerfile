@@ -37,10 +37,9 @@ RUN apt-get update && \
 
 # Copy application code and model weights
 COPY app.py .
-COPY "mask_detector High acccu.pth" .
-
+COPY mask_detector.pth .
 # Environment
-ENV MODEL_PATH="mask_detector High acccu.pth"
+ENV MODEL_PATH="mask_detector.pth"
 ENV CONFIDENCE_THRESHOLD=0.5
 ENV PORT=8000
 
