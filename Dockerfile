@@ -2,53 +2,60 @@
 # Face Mask Detection API — Dockerfile
 # ─────────────────────────────────────────────────────────────
 # Multi-stage build: keeps the final image lean.
-# Supports CPU out-of-the-box.  For GPU, swap the base image
-# to an NVIDIA CUDA image (see comments below).
+# The model (158MB) is downloaded from Google Drive during build.
 # ─────────────────────────────────────────────────────────────
 
-# ── Stage 1: Builder ────────────────────────────────────────
+
+# ── Stage 1: Builder ─────────────────────────────────────────
 FROM python:3.11-slim AS builder
 
 WORKDIR /build
 
-# Install build-time OS deps (none needed for CPU-only torch)
+# Install build dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends gcc && \
     rm -rf /var/lib/apt/lists/*
 
+# Copy requirements
 COPY requirements.txt .
 
-# Install Python deps into a prefix so we can copy them cleanly
+# Install Python dependencies
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 
-# ── Stage 2: Runtime ────────────────────────────────────────
+# ── Stage 2: Runtime ─────────────────────────────────────────
 FROM python:3.11-slim
 
 WORKDIR /app
 
-# Copy installed packages from builder
+# Copy installed Python packages from builder stage
 COPY --from=builder /install /usr/local
 
-# Install minimal runtime OS deps
+# Install minimal runtime dependencies (needed for OpenCV)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends libgl1 libglib2.0-0 && \
     rm -rf /var/lib/apt/lists/*
 
-# Copy application code and model weights
+# Copy application code
 COPY app.py .
-COPY mask_detector.pth .
-# Environment
+
+# Install gdown to download large model files
+RUN pip install --no-cache-dir gdown
+
+# Download model from Google Drive
+RUN gdown https://drive.google.com/uc?id=1Mfjzif_-ylB-NxC6VEHr2k-lNcQ8tZox -O mask_detector.pth
+
+# Environment variables
 ENV MODEL_PATH="mask_detector.pth"
 ENV CONFIDENCE_THRESHOLD=0.5
 ENV PORT=8000
 
-# Expose the API port
+# Expose API port
 EXPOSE 8000
 
-# Health-check (container orchestrators like Docker Compose / K8s)
+# Health check endpoint
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
+CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
 
-# Run the server
+# Run API
 CMD ["python", "app.py"]
