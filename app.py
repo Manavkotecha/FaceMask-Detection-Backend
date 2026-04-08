@@ -25,7 +25,7 @@ import torchvision.transforms as T
 from torchvision.models.detection import fasterrcnn_resnet50_fpn
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from PIL import Image
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel
@@ -122,28 +122,32 @@ def predict_frame(frame_bgr: np.ndarray, confidence_threshold: float = CONFIDENC
     Run the Faster R-CNN model on a single BGR frame.
     Returns a list of dicts: [{ label, confidence, bbox }]
     """
-    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    pil_image = Image.fromarray(frame_rgb)
-    img_tensor = transform(pil_image).unsqueeze(0).to(DEVICE)
+    try:
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(frame_rgb)
+        img_tensor = transform(pil_image).unsqueeze(0).to(DEVICE)
 
-    with torch.no_grad():
-        outputs = model(img_tensor)[0]
+        with torch.no_grad():
+            outputs = model(img_tensor)[0]
 
-    detections = []
-    for box, label, score in zip(outputs["boxes"], outputs["labels"], outputs["scores"]):
-        if score.item() < confidence_threshold:
-            continue
-        label_id = label.item()
-        label_name = LABEL_MAP.get(label_id)
-        if label_name is None:
-            continue
-        detections.append({
-            "label": label_name,
-            "confidence": round(score.item(), 4),
-            "bbox": [round(c, 2) for c in box.tolist()],
-        })
+        detections = []
+        for box, label, score in zip(outputs["boxes"], outputs["labels"], outputs["scores"]):
+            if score.item() < confidence_threshold:
+                continue
+            label_id = label.item()
+            label_name = LABEL_MAP.get(label_id)
+            if label_name is None:
+                continue
+            detections.append({
+                "label": label_name,
+                "confidence": round(score.item(), 4),
+                "bbox": [round(c, 2) for c in box.tolist()],
+            })
 
-    return detections
+        return detections
+    except Exception as exc:
+        print(f"⚠️  Error in predict_frame: {exc}")
+        return []
 
 
 def draw_detections_on_frame(frame: np.ndarray, detections: list) -> np.ndarray:
@@ -212,52 +216,67 @@ async def predict(file: UploadFile = File(...)):
 
     try:
         image_bytes = await file.read()
+        if not image_bytes:
+            raise ValueError("Empty image file")
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        
+        # Validate image dimensions
+        if image.width <= 0 or image.height <= 0:
+            raise ValueError("Invalid image dimensions")
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Could not read image: {exc}")
+        raise HTTPException(status_code=400, detail=f"Could not read image: {str(exc)}")
 
     # ── Inference ───────────────────────────────────────────────────────────
-    img_tensor = transform(image).unsqueeze(0).to(DEVICE)
+    try:
+        img_tensor = transform(image).unsqueeze(0).to(DEVICE)
 
-    with torch.no_grad():
-        outputs = model(img_tensor)[0]
+        with torch.no_grad():
+            outputs = model(img_tensor)[0]
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Inference failed: {str(exc)}")
 
     # ── Post-process ────────────────────────────────────────────────────────
-    detections: List[Detection] = []
-    counts = {"with_mask": 0, "without_mask": 0, "mask_weared_incorrect": 0}
+    try:
+        detections: List[Detection] = []
+        counts = {"with_mask": 0, "without_mask": 0, "mask_weared_incorrect": 0}
 
-    for box, label, score in zip(
-        outputs["boxes"], outputs["labels"], outputs["scores"]
-    ):
-        if score.item() < CONFIDENCE_THRESHOLD:
-            continue
-        label_id = label.item()
-        label_name = LABEL_MAP.get(label_id)
-        if label_name is None:
-            continue  # skip background or unknown
+        for box, label, score in zip(
+            outputs["boxes"], outputs["labels"], outputs["scores"]
+        ):
+            if score.item() < CONFIDENCE_THRESHOLD:
+                continue
+            label_id = label.item()
+            label_name = LABEL_MAP.get(label_id)
+            if label_name is None:
+                continue  # skip background or unknown
 
-        counts[label_name] += 1
-        detections.append(
-            Detection(
-                label=label_name,
-                confidence=round(score.item(), 4),
-                bbox=[round(c, 2) for c in box.tolist()],
+            counts[label_name] += 1
+            detections.append(
+                Detection(
+                    label=label_name,
+                    confidence=round(score.item(), 4),
+                    bbox=[round(c, 2) for c in box.tolist()],
+                )
             )
-        )
 
-    return PredictionResponse(
-        total_detections=len(detections),
-        with_mask=counts["with_mask"],
-        without_mask=counts["without_mask"],
-        mask_weared_incorrect=counts["mask_weared_incorrect"],
-        detections=detections,
-    )
+        return PredictionResponse(
+            total_detections=len(detections),
+            with_mask=counts["with_mask"],
+            without_mask=counts["without_mask"],
+            mask_weared_incorrect=counts["mask_weared_incorrect"],
+            detections=detections,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Post-processing failed: {str(exc)}")
 
 
 @app.post("/predict/video", tags=["Prediction"])
 async def predict_video(
     file: UploadFile = File(...),
     frame_skip: int = Query(default=3, ge=1, le=30, description="Process every Nth frame (1 = all frames)"),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
 ):
     """
     Upload a video file and receive an annotated video with face-mask detections.
@@ -294,10 +313,18 @@ async def predict_video(
     input_tmp.close()
     output_tmp.close()
 
+    output_path = output_tmp.name
+
     try:
         # ── Open input video ────────────────────────────────────────────────
         cap = cv2.VideoCapture(input_tmp.name)
         if not cap.isOpened():
+            # Clean up before raising
+            try:
+                os.unlink(input_tmp.name)
+                os.unlink(output_tmp.name)
+            except OSError:
+                pass
             raise HTTPException(
                 status_code=400, detail="Could not open video file. The format may be unsupported."
             )
@@ -307,14 +334,31 @@ async def predict_video(
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
+        # Validate video dimensions
+        if width <= 0 or height <= 0:
+            cap.release()
+            try:
+                os.unlink(input_tmp.name)
+                os.unlink(output_tmp.name)
+            except OSError:
+                pass
+            raise HTTPException(
+                status_code=400, detail="Invalid video dimensions detected."
+            )
+
         # ── Open output writer ──────────────────────────────────────────────
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(output_tmp.name, fourcc, fps, (width, height))
+        writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
         if not writer.isOpened():
             cap.release()
+            try:
+                os.unlink(input_tmp.name)
+                os.unlink(output_tmp.name)
+            except OSError:
+                pass
             raise HTTPException(
-                status_code=500, detail="Could not create output video writer."
+                status_code=500, detail="Could not create output video writer. Check VideoCodec support."
             )
 
         # ── Process frames ──────────────────────────────────────────────────
@@ -363,9 +407,24 @@ async def predict_video(
             "mask_weared_incorrect": total_counts["mask_weared_incorrect"],
         }
 
-        # ── Return annotated video ──────────────────────────────────────────
+        # ── Schedule cleanup and return video ───────────────────────────────
+        # Use BackgroundTasks to clean up AFTER the file is streamed to the client
+        def cleanup_files():
+            import time
+            time.sleep(1)  # Give time for file to be fully sent
+            try:
+                os.unlink(input_tmp.name)
+            except OSError:
+                pass
+            try:
+                os.unlink(output_path)
+            except OSError:
+                pass
+
+        background_tasks.add_task(cleanup_files)
+
         return FileResponse(
-            path=output_tmp.name,
+            path=output_path,
             media_type="video/mp4",
             filename="mask_detection_output.mp4",
             headers={"X-Video-Stats": json.dumps(stats)},
@@ -374,13 +433,16 @@ async def predict_video(
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Video processing failed: {exc}")
-    finally:
-        # Clean up input temp file (output is cleaned up by FileResponse)
+        # Clean up on error
         try:
             os.unlink(input_tmp.name)
         except OSError:
             pass
+        try:
+            os.unlink(output_tmp.name)
+        except OSError:
+            pass
+        raise HTTPException(status_code=500, detail=f"Video processing failed: {exc}")
 
 
 # ─── Main ──────────────────────────────────────────────────────────────────────
