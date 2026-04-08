@@ -41,14 +41,14 @@ COPY mask_detector.pth .
 # Environment
 ENV MODEL_PATH="mask_detector.pth"
 ENV CONFIDENCE_THRESHOLD=0.5
-ENV PORT=8000
+ENV PORT=7860
 
-# Expose the API port
-EXPOSE 8000
+# Expose the API port (7860 = HF Spaces default)
+EXPOSE 7860
 
 # Health-check (container orchestrators like Docker Compose / K8s)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:7860/health')" || exit 1
 
 # Run the server
 CMD ["python", "app.py"]
