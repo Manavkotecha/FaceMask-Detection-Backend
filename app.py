@@ -25,10 +25,9 @@ import torchvision.transforms as T
 from torchvision.models.detection import fasterrcnn_resnet50_fpn
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from PIL import Image
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
-from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 
 # ─── Configuration ─────────────────────────────────────────────────────────────
@@ -94,14 +93,6 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["X-Video-Stats"],
 )
-
-# Allow large video uploads (up to 500 MB)
-class LargeUploadMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        request._body_size = 500 * 1024 * 1024  # 500 MB
-        return await call_next(request)
-
-app.add_middleware(LargeUploadMiddleware)
 
 # Load model at startup
 model = load_model(MODEL_PATH)
@@ -396,5 +387,5 @@ async def predict_video(
 if __name__ == "__main__":
     import uvicorn
 
-    port = int(os.getenv("PORT", "7860"))  # 7860 is the HF Spaces default port
+    port = int(os.getenv("PORT", "8000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
